@@ -14,7 +14,7 @@ The following are the requirements for using your data with this model:
 - The data type of the target field, past covariates and future covariates must be NUMERIC.
 - The train and test (or prediction) files must contain an ID field. The train data must also contain a target series.
 - The data need to be preprocessed because the implementation assumes the data is cleaned and has no missing values.
-
+- PatchMixer does not support static and future covariates
 ---
 
 Here are the highlights of this implementation: <br/>
@@ -116,5 +116,4 @@ Repository created by Ready Tensor, Inc. (https://www.readytensor.ai/)
 ## Acknowledgements
 
 - [Darts](https://unit8co.github.io/darts/) for the implementation of the base forecasting model.
-- [PatchMixer-pytorch](https://github.com/ditschuk/pytorch-PatchMixer/tree/main) for the implementation of the PatchMixer model.
 - [tsf-new-paper-taste](https://github.com/hughxx/tsf-new-paper-taste) for Reverse Instance Normalization implementation.

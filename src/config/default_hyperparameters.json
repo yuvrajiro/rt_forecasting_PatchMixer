@@ -1,20 +1,19 @@
 {
   "history_forecast_ratio": 10,
   "lags_forecast_ratio": 3,
-  "hidden_size": 32,
-  "ff_dim": 64,
-  "num_block": 6,
   "add_relative_index": true,
-  "dropout": 0.0,
   "n_epochs": 100,
   "batch_size": 16,
   "force_reset": true,
-  "norm_type": "layer",
   "save_checkpoints": true,
   "optimizer_kwargs": {"lr": 1e-2},
   "use_exogenous": true,
   "random_state": 0,
   "use_past_covariates": true,
   "use_future_covariates": true,
-  "use_static_covariates": true
+  "use_static_covariates": true,
+  "patch_len": 16,
+  "stride": 8,
+  "padding_patch": "end"
 }
+

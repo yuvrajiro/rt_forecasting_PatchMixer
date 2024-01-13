@@ -90,400 +90,6 @@ class RevIN(nn.Module):
         return x
 
 
-class TimeBatchNorm2d(nn.BatchNorm1d):
-    """A batch normalization layer that normalizes over the last two dimensions of a
-    sequence in PyTorch, mimicking Keras behavior.
-
-    This class extends nn.BatchNorm1d to apply batch normalization across time and
-    feature dimensions.
-
-    Attributes:
-        num_time_steps (int): Number of time steps in the input.
-        num_channels (int): Number of channels in the input.
-    """
-
-    def __init__(self, normalized_shape: tuple[int, int]):
-        """Initializes the TimeBatchNorm2d module.
-
-        Args:
-            normalized_shape (tuple[int, int]): A tuple (num_time_steps, num_channels)
-                representing the shape of the time and feature dimensions to normalize.
-        """
-        num_time_steps, num_channels = normalized_shape
-        super().__init__(num_channels * num_time_steps)
-        self.num_time_steps = num_time_steps
-        self.num_channels = num_channels
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Applies the batch normalization over the last two dimensions of the input tensor.
-
-        Args:
-            x (Tensor): A 3D tensor with shape (N, S, C), where N is the batch size,
-                S is the number of time steps, and C is the number of channels.
-
-        Returns:
-            Tensor: A 3D tensor with batch normalization applied over the last two dims.
-
-        Raises:
-            ValueError: If the input tensor is not 3D.
-        """
-        if x.ndim != 3:
-            raise ValueError(f"Expected 3D input tensor, but got {x.ndim}D tensor instead.")
-
-        # Reshaping input to combine time and feature dimensions for normalization
-        x = x.reshape(x.shape[0], -1, 1)
-
-        # Applying batch normalization
-        x = super().forward(x)
-
-        # Reshaping back to original dimensions (N, S, C)
-        x = x.reshape(x.shape[0], self.num_time_steps, self.num_channels)
-
-        return x
-
-
-class FeatureMixing(nn.Module):
-    """A module for feature mixing with flexibility in normalization and activation.
-
-    This module provides options for batch normalization before or after mixing features,
-    uses dropout for regularization, and allows for different activation functions.
-
-    Args:
-        sequence_length: The length of the sequences to be transformed.
-        input_channels: The number of input channels to the module.
-        output_channels: The number of output channels from the module.
-        ff_dim: The dimension of the feed-forward network internal to the module.
-        activation_fn: The activation function used within the feed-forward network.
-        dropout_rate: The dropout probability used for regularization.
-        normalize_before: A boolean indicating whether to apply normalization before
-            the rest of the operations.
-    """
-
-    def __init__(
-            self,
-            sequence_length: int,
-            input_channels: int,
-            output_channels: int,
-            ff_dim: int,
-            activation_fn: Callable[[torch.Tensor], torch.Tensor] = F.relu,
-            dropout_rate: float = 0.1,
-            normalize_before: bool = True,
-            norm_type: type[nn.Module] = TimeBatchNorm2d,
-    ):
-        """Initializes the FeatureMixing module with the provided parameters."""
-        super().__init__()
-
-        self.norm_before = (
-            norm_type((sequence_length, input_channels))
-            if normalize_before
-            else nn.Identity()
-        )
-        self.norm_after = (
-            norm_type((sequence_length, output_channels))
-            if not normalize_before
-            else nn.Identity()
-        )
-
-        self.activation_fn = activation_fn
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc1 = nn.Linear(input_channels, ff_dim)
-        self.fc2 = nn.Linear(ff_dim, output_channels)
-
-        self.projection = (
-            nn.Linear(input_channels, output_channels)
-            if input_channels != output_channels
-            else nn.Identity()
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass for the FeatureMixing module.
-
-        Args:
-            x: A 3D tensor with shape (N, C, L) where C is the channel dimension.
-
-        Returns:
-            The output tensor after feature mixing.
-        """
-
-        x_proj = self.projection(x)
-
-        x = self.norm_before(x)
-
-        x = self.fc1(x)  # Apply the first linear transformation.
-        x = self.activation_fn(x)  # Apply the activation function.
-        x = self.dropout(x)  # Apply dropout for regularization.
-        x = self.fc2(x)  # Apply the second linear transformation.
-        x = self.dropout(x)  # Apply dropout again if needed.
-
-        x = x_proj + x  # Add the projection shortcut to the transformed features.
-
-        return self.norm_after(x)
-
-
-class ConditionalFeatureMixing(nn.Module):
-    """Conditional feature mixing module that incorporates static features.
-
-    This module extends the feature mixing process by including static features. It uses
-    a linear transformation to integrate static features into the dynamic feature space,
-    then applies the feature mixing on the concatenated features.
-
-    Args:
-        input_channels: The number of input channels of the dynamic features.
-        output_channels: The number of output channels after feature mixing.
-        static_channels: The number of channels in the static feature input.
-        ff_dim: The inner dimension of the feedforward network used in feature mixing.
-        activation_fn: The activation function used in feature mixing.
-        dropout_rate: The dropout probability used in the feature mixing operation.
-    """
-
-    def __init__(
-            self,
-            sequence_length: int,
-            input_channels: int,
-            output_channels: int,
-            static_channels: int,
-            ff_dim: int,
-            activation_fn: Callable = F.relu,
-            dropout_rate: float = 0.1,
-            normalize_before: bool = False,
-            norm_type: type[nn.Module] = nn.LayerNorm,
-    ):
-        super().__init__()
-
-        self.fr_static = nn.Linear(static_channels, output_channels)
-        self.fm = FeatureMixing(
-            sequence_length,
-            input_channels + output_channels,
-            output_channels,
-            ff_dim,
-            activation_fn,
-            dropout_rate,
-            normalize_before=normalize_before,
-            norm_type=norm_type,
-        )
-
-    def forward(
-            self, x: torch.Tensor, x_static: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Applies conditional feature mixing using both dynamic and static inputs.
-
-        Args:
-            x: A tensor representing dynamic features, typically with shape
-               [batch_size, time_steps, input_channels].
-            x_static: A tensor representing static features, typically with shape
-               [batch_size, static_channels].
-
-        Returns:
-            A tuple containing:
-            - The output tensor after applying conditional feature mixing.
-            - The transformed static features tensor for monitoring or further processing.
-        """
-        v = self.fr_static(x_static)  # Transform static features to match output channels.
-
-        # v = v.unsqueeze(1).repeat(
-        #     1, x.shape[1], 1
-        # )  # Repeat static features across time steps.
-        required_shape = (1, x.shape[1], 1)
-
-        if v.shape != required_shape:
-            v = v.unsqueeze(1).repeat(
-                1, x.shape[1], 1
-            )  # Repeat static features across time steps.
-
-        return (
-            self.fm(
-                torch.cat([x, v], dim=-1)
-            ),  # Apply feature mixing on concatenated features.
-            v.detach(),  # Return detached static feature for monitoring or further use.
-        )
-
-
-class TimeMixing(nn.Module):
-    """Applies a transformation over the time dimension of a sequence.
-
-    This module applies a linear transformation followed by an activation function
-    and dropout over the sequence length of the input feature tensor after converting
-    feature maps to the time dimension and then back.
-
-    Args:
-        input_channels: The number of input channels to the module.
-        sequence_length: The length of the sequences to be transformed.
-        activation_fn: The activation function to be used after the linear transformation.
-        dropout_rate: The dropout probability to be used after the activation function.
-    """
-
-    def __init__(
-            self,
-            sequence_length: int,
-            input_channels: int,
-            activation_fn: Callable = F.relu,
-            dropout_rate: float = 0.1,
-            norm_type: type[nn.Module] = TimeBatchNorm2d,
-    ):
-        """Initializes the TimeMixing module with the specified parameters."""
-        super().__init__()
-        self.norm = norm_type((sequence_length, input_channels))
-        self.activation_fn = activation_fn
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc1 = nn.Linear(sequence_length, sequence_length)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies the time mixing operations on the input tensor.
-
-        Args:
-            x: A 3D tensor with shape (N, C, L), where C = channel dimension and
-                L = sequence length.
-
-        Returns:
-            The normalized output tensor after time mixing transformations.
-        """
-        x_temp = feature_to_time(x)  # Convert feature maps to time dimension. Assumes definition elsewhere.
-        x_temp = self.activation_fn(self.fc1(x_temp))
-        x_temp = self.dropout(x_temp)
-        x_res = time_to_feature(x_temp)  # Convert back from time to feature maps.
-
-        return self.norm(x + x_res)  # Apply normalization and combine with original input.
-
-
-class MixerLayer(nn.Module):
-    """A residual block that combines time and feature mixing for sequence data.
-
-    This module sequentially applies time mixing and feature mixing, which are forms
-    of data augmentation and feature transformation that can help in learning temporal
-    dependencies and feature interactions respectively.
-
-    Args:
-        sequence_length: The length of the input sequences.
-        input_channels: The number of input channels to the module.
-        output_channels: The number of output channels from the module.
-        ff_dim: The inner dimension of the feedforward network used in feature mixing.
-        activation_fn: The activation function used in both time and feature mixing.
-        dropout_rate: The dropout probability used in both mixing operations.
-    """
-
-    def __init__(
-            self,
-            sequence_length: int,
-            input_channels: int,
-            output_channels: int,
-            ff_dim: int,
-            activation_fn: Callable = F.relu,
-            dropout_rate: float = 0.1,
-            normalize_before: bool = False,
-            norm_type: type[nn.Module] = nn.LayerNorm,
-    ):
-        """Initializes the MixLayer with time and feature mixing modules."""
-        super().__init__()
-
-        self.time_mixing = TimeMixing(
-            sequence_length,
-            input_channels,
-            activation_fn,
-            dropout_rate,
-            norm_type=norm_type,
-        )
-        self.feature_mixing = FeatureMixing(
-            sequence_length,
-            input_channels,
-            output_channels,
-            ff_dim,
-            activation_fn,
-            dropout_rate,
-            norm_type=norm_type,
-            normalize_before=normalize_before,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass for the MixLayer module.
-
-        Args:
-            x: A 3D tensor with shape (N, C, L) to be processed by the mixing layers.
-
-        Returns:
-            The output tensor after applying time and feature mixing operations.
-        """
-        x = self.time_mixing(x)  # Apply time mixing first.
-        x = self.feature_mixing(x)  # Then apply feature mixing.
-
-        return x
-
-
-class ConditionalMixerLayer(nn.Module):
-    """Conditional mix layer combining time and feature mixing with static context.
-
-    This module combines time mixing and conditional feature mixing, where the latter
-    is influenced by static features. This allows the module to learn representations
-    that are influenced by both dynamic and static features.
-
-    Args:
-        sequence_length: The length of the input sequences.
-        input_channels: The number of input channels of the dynamic features.
-        output_channels: The number of output channels after feature mixing.
-        static_channels: The number of channels in the static feature input.
-        ff_dim: The inner dimension of the feedforward network used in feature mixing.
-        activation_fn: The activation function used in both mixing operations.
-        dropout_rate: The dropout probability used in both mixing operations.
-    """
-
-    def __init__(
-            self,
-            sequence_length: int,
-            input_channels: int,
-            output_channels: int,
-            static_channels: int,
-            ff_dim: int,
-            activation_fn: Callable = F.relu,
-            dropout_rate: float = 0.1,
-            normalize_before: bool = False,
-            norm_type: type[nn.Module] = nn.LayerNorm,
-    ):
-        super().__init__()
-
-        self.time_mixing = TimeMixing(
-            sequence_length,
-            input_channels,
-            activation_fn,
-            dropout_rate,
-            norm_type=norm_type,
-        )
-        self.feature_mixing = ConditionalFeatureMixing(
-            sequence_length,
-            input_channels,
-            output_channels=output_channels,
-            static_channels=static_channels,
-            ff_dim=ff_dim,
-            activation_fn=activation_fn,
-            dropout_rate=dropout_rate,
-            normalize_before=normalize_before,
-            norm_type=norm_type,
-        )
-
-    def forward(self, x: torch.Tensor, x_static: torch.Tensor) -> torch.Tensor:
-        """Forward pass for the conditional mix layer.
-
-        Args:
-            x: A tensor representing dynamic features, typically with shape
-               [batch_size, time_steps, input_channels].
-            x_static: A tensor representing static features, typically with shape
-               [batch_size, static_channels].
-
-        Returns:
-            The output tensor after applying time and conditional feature mixing.
-        """
-        x = self.time_mixing(x)  # Apply time mixing first.
-        x, _ = self.feature_mixing(x, x_static)  # Then apply conditional feature mixing.
-
-        return x
-
-
-def time_to_feature(x: torch.Tensor) -> torch.Tensor:
-    """Converts a time series tensor to a feature tensor."""
-    return x.permute(0, 2, 1)
-
-
-feature_to_time = time_to_feature
-
-
 
 
 class Mlp(nn.Module):
@@ -591,13 +197,10 @@ class _PatchMixer(PLMixedCovariatesModule):
             output_dim: Tuple[int, int],
             variables_meta: Dict[str, Dict[str, List[str]]],
             num_static_components: int,
-            hidden_size: int,
-            ff_dim: int,
-            num_block: int,
-            hidden_continuous_size: int,
-            dropout: float,
             add_relative_index: bool,
-            norm_type: Union[str, nn.Module],
+            patch_len: int = 16,
+            stride: int = 8,
+            padding_patch: str = 'end',
             **kwargs,
     ):
 
@@ -638,116 +241,22 @@ class _PatchMixer(PLMixedCovariatesModule):
         self.n_targets, self.loss_size = output_dim
         self.variables_meta = variables_meta
         self.num_static_components = num_static_components
-        self.hidden_size = hidden_size
-        self.hidden_continuous_size = hidden_continuous_size
-        self.num_block = num_block
-        self.dropout = dropout
         self.add_relative_index = add_relative_index
         self.n_input_channels = n_input_channels
-        self.ff_dim = ff_dim
-
-        # initialize last batch size to check if new mask needs to be generated
+        self.patch_len = patch_len
+        self.stride = stride
+        self.padding_patch = padding_patch
         self.batch_size_last = -1
         self.relative_index = None
-
-        self.past_normalizer = RevIN(num_features=self.n_targets, subtract_last=True)
-
-        static_channels = num_static_components if num_static_components > 0 else 1
         self.static_channel_provided = num_static_components > 0
-        print(f"static_channels: {static_channels}")
-
-        activation_fn = kwargs.get("activation_fn", "relu")
-        if hasattr(F, activation_fn):
-            activation_fn = getattr(F, activation_fn)
-        else:
-            raise ValueError(f"Unknown activation function: {activation_fn}")
-
-
-        assert norm_type in {
-            "batch",
-            "layer",
-        }, f"Invalid norm_type: {norm_type}, must be one of batch, layer."
-        norm_type = TimeBatchNorm2d if norm_type == "batch" else nn.LayerNorm
-        sequence_length = self.input_chunk_length
-        prediction_length = self.output_chunk_length
-        output_channels = self.n_targets
-        input_channels = n_input_channels
-        extra_channels = n_extra_channels
-        dropout_rate = self.dropout
-        normalize_before = False
-        num_blocks = self.num_block
-        self.fc_hist = nn.Linear(sequence_length, prediction_length)
-        output_channels = self.n_targets
-        self.fc_out = nn.Linear(self.hidden_size, output_channels)
-
-        self.feature_mixing_hist = ConditionalFeatureMixing(
-            sequence_length=prediction_length,
-            input_channels=input_channels + extra_channels,
-            output_channels=self.hidden_size,
-            static_channels=static_channels,
-            ff_dim=self.ff_dim,
-            activation_fn=activation_fn,
-            dropout_rate=dropout_rate,
-            normalize_before=normalize_before,
-            norm_type=norm_type,
-        )
-        self.feature_mixing_future = ConditionalFeatureMixing(
-            sequence_length=prediction_length,
-            input_channels=extra_channels,
-            output_channels=self.hidden_size,
-            static_channels=static_channels,
-            ff_dim=self.ff_dim,
-            activation_fn=activation_fn,
-            dropout_rate=dropout_rate,
-            normalize_before=normalize_before,
-            norm_type=norm_type,
-        )
-
-        self.conditional_mixer = self._build_mixer(
-            num_blocks,
-            self.hidden_size,
-            prediction_length,
-            ff_dim=self.ff_dim,
-            static_channels=static_channels,
-            activation_fn=activation_fn,
-            dropout_rate=dropout_rate,
-            normalize_before=normalize_before,
-            norm_type=norm_type,
-        )
-
-        self.fc_out = nn.Linear(self.n_input_channels + n_extra_channels, self.n_targets)
-        self.patch_len = 16
-        self.stride = 8
-        self.padding_patch = 'end'
-
-        # initialize last batch size to check if new mask needs to be generated
-        self.batch_size_last = -1
-        self.relative_index = None
         self.seq_len = self.input_chunk_length
         self.pred_len = self.output_chunk_length
-
+        self.fc_out = nn.Linear(self.n_input_channels + n_extra_channels, self.n_targets)
+        self.batch_size_last = -1
+        self.relative_index = None
         self.rev = RevIN(num_features=self.n_targets, subtract_last=True)
         self.backbone = Backbone(self.seq_len, self.pred_len, patch_len=self.patch_len, stride=self.stride,
                                  padding_patch=self.padding_patch)
-
-    @staticmethod
-    def _build_mixer(
-            num_blocks: int, hidden_channels: int, prediction_length: int, **kwargs
-    ):
-        """Build the mixer blocks for the model."""
-        channels = [2 * hidden_channels] + [hidden_channels] * (num_blocks - 1)
-
-        return nn.ModuleList(
-            [
-                ConditionalMixerLayer(
-                    input_channels=in_ch,
-                    output_channels=out_ch,
-                    sequence_length=prediction_length,
-                    **kwargs,
-                )
-                for in_ch, out_ch in zip(channels[:-1], channels[1:])
-            ]
-        )
 
     @property
     def reals(self) -> List[str]:
@@ -881,19 +390,6 @@ class _PatchMixer(PLMixedCovariatesModule):
                 ],
                 dim=dim_variable,
             )
-        # x_hist = x_cont_past
-        # x_static = x_static.view(x_cont_past.size(0), self.num_static_components, -1).squeeze(2) if self.static_channel_provided else torch.zeros([x_hist.size(0), 1], dtype=torch.float64)
-        # x_hist_temp = feature_to_time(x_hist)
-        # x_hist_temp = self.fc_hist(x_hist_temp)
-        # x_hist = time_to_feature(x_hist_temp)
-        # x_hist, _ = self.feature_mixing_hist(x_hist, x_static=x_static)
-        # x_future, _ = self.feature_mixing_future(x_cont_future, x_static=x_static)
-        # x = torch.cat([x_hist, x_future], dim=-1)
-        # for mixing_layer in self.conditional_mixer:
-        #     x = mixing_layer(x, x_static=x_static)
-        # x = self.fc_out(x)
-        #
-        # x = self.past_normalizer(x, mode='denorm')
         z = self.backbone(x_cont_past)  # B, L, D -> B, H, D
         z = self.fc_out(z)
         z = self.rev(z, 'denorm')  # B, L, D -> B, H, D
@@ -908,17 +404,15 @@ class PatchMixer(MixedCovariatesTorchModel):
             output_chunk_length: int,
             n_input_channels: int,
             n_extra_channels: int,
-            hidden_size: int = 16,
-            ff_dim: int = 32,
-            num_block: int = 10,
-            dropout: float = 0.1,
-            hidden_continuous_size: int = 8,
             add_relative_index: bool = False,
-            norm_type: Union[str, nn.Module] = "batch",
             use_static_covariates: bool = True,
+            patch_len: int = 16,
+            stride: int = 8,
+            padding_patch: str = 'end',
             **kwargs,
     ):
         """
+
         PyTorch implementation of the New PatchMixer model from `this paper <https://arxiv.org/pdf/2303.06053.pdf>`_.
         The implemntation use Darts Forescasting Module, this class works as a plugin for Darts.
 
@@ -949,7 +443,15 @@ class PatchMixer(MixedCovariatesTorchModel):
         kwargs
             all parameters required for :class:`darts.model.forecasting_models.TorchForecastingModel` base class.
 
-
+n_input_channels: int,
+            n_extra_channels: int,
+            output_dim: Tuple[int, int],
+            variables_meta: Dict[str, Dict[str, List[str]]],
+            num_static_components: int,
+            add_relative_index: bool,
+            patch_len: int = 16,
+            stride: int = 8,
+            padding_patch: str = 'end',
 
         """
 
@@ -958,18 +460,15 @@ class PatchMixer(MixedCovariatesTorchModel):
         model_kwargs["loss_fn"] = nn.MSELoss()
         super().__init__(**self._extract_torch_model_params(**model_kwargs))
         self.pl_module_params = self._extract_pl_module_params(**model_kwargs)
-        self.hidden_size = hidden_size
-        self.num_block = num_block
-        self.ff_dim = ff_dim
-        self.dropout = dropout
-        self.hidden_continuous_size = hidden_continuous_size
         self.n_input_channels = n_input_channels
         self.n_extra_channels = n_extra_channels
         self.add_relative_index = add_relative_index
         self.output_dim: Optional[Tuple[int, int]] = None
-        self.norm_type = norm_type
         self._considers_static_covariates = use_static_covariates
         categorical_embedding_sizes = None
+        self.patch_len = patch_len
+        self.stride = stride
+        self.padding_patch = padding_patch
         self.categorical_embedding_sizes = (
             categorical_embedding_sizes
             if categorical_embedding_sizes is not None
@@ -1158,13 +657,10 @@ class PatchMixer(MixedCovariatesTorchModel):
             output_dim=self.output_dim,
             variables_meta=variables_meta,
             num_static_components=n_static_components,
-            hidden_size=self.hidden_size,
-            ff_dim= self.ff_dim,
-            dropout=self.dropout,
-            num_block=self.num_block,
-            hidden_continuous_size=self.hidden_continuous_size,
             add_relative_index=self.add_relative_index,
-            norm_type=self.norm_type,
+            patch_len=self.patch_len,
+            stride=self.stride,
+            padding_patch=self.padding_patch,
             **self.pl_module_params,
         )
 
@@ -1207,6 +703,8 @@ class PatchMixer(MixedCovariatesTorchModel):
 
     @property
     def supports_static_covariates(self) -> bool:
-        return True
+        return False
+
+
 
 
